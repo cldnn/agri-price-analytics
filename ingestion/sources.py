@@ -1,6 +1,7 @@
 """Request boundaries and validation for the initial raw collection."""
 import calendar
 import json
+import re
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 from urllib.parse import quote, unquote, urlencode
@@ -10,16 +11,13 @@ END = date(2026, 11, 23)
 CODE_OPS = ("wholesaleMarkets", "units", "sizes", "corps", "placeOrigins", "packagings", "grades", "goods")
 FUEL_CODES = frozenset({"B027", "B034", "D047", "C004", "K015"})
 SETTLEMENT_OP = "Grid_20240625000000000653_1"
-MARKET_SOURCES = ("DS-001", "DS-002")
-OPS = {"DS-001": SETTLEMENT_OP, "DS-002": "trades", "DS-003": "getWthrDataList",
-       "DS-004": "getItemtradeList", "DS-005": "dateAvgRecentPrice.do"}
-URLS = {"DS-002": "https://apis.data.go.kr/B552845/katOrigin/",
-        "DS-003": "https://apis.data.go.kr/1360000/AsosDalyInfoService/",
-        "DS-004": "https://apis.data.go.kr/1220000/Itemtrade/",
-        "DS-005": "https://www.opinet.co.kr/api/",
-        "DS-006": "https://apis.data.go.kr/B552845/katCode/"}
-# The auction API specifies four digits for numOfRows.
-PAGE_SIZE = {"DS-001": 1000, "DS-002": 9999, "DS-003": 366, "DS-006": 1000}
+OPS = {"DS-001": SETTLEMENT_OP, "DS-002": "getWthrDataList",
+       "DS-003": "getItemtradeList", "DS-004": "dateAvgRecentPrice.do"}
+URLS = {"DS-002": "https://apis.data.go.kr/1360000/AsosDalyInfoService/",
+        "DS-003": "https://apis.data.go.kr/1220000/Itemtrade/",
+        "DS-004": "https://www.opinet.co.kr/api/",
+        "DS-005": "https://apis.data.go.kr/B552845/katCode/"}
+PAGE_SIZE = {"DS-001": 1000, "DS-002": 366, "DS-005": 1000}
 
 
 class CollectionError(Exception):
@@ -35,24 +33,28 @@ def month_end(day):
     return day.replace(day=calendar.monthrange(day.year, day.month)[1])
 
 
-def jobs(source, snapshot_date, markets=(), stations=(), hs_codes=()):
-    if source == "DS-006":
+def jobs(source, snapshot_date, markets=(), stations=(), hs_codes=(), *, hs_chapters=None):
+    if source == "DS-005":
         for op in CODE_OPS:
             yield op, snapshot_date, ""
         return
     day = END
     while day >= START:
-        if source in MARKET_SOURCES:
+        if source == "DS-001":
             for market in markets:
                 yield OPS[source], day.isoformat(), market
             day -= timedelta(days=1)
-        elif source == "DS-005":
+        elif source == "DS-004":
             yield OPS[source], day.isoformat(), "ALL"
             day -= timedelta(days=7)
         else:
-            if source == "DS-003" or day < END:
-                for code in stations if source == "DS-003" else hs_codes:
-                    yield OPS[source], day.strftime("%Y-%m"), code
+            if source == "DS-002" or day < END:
+                period = day.strftime("%Y-%m")
+                codes = stations if source == "DS-002" else hs_codes
+                if source == "DS-003" and hs_chapters is not None:
+                    codes = ["ALL", *hs_chapters(period)]
+                for code in codes:
+                    yield OPS[source], period, code
             day = day.replace(day=1) - timedelta(days=1)
 
 
@@ -72,22 +74,22 @@ def request(source, op, period, entity, page, env, *, page_size=None):
     params = {}
     if source in PAGE_SIZE:
         params.update(pageNo=page, numOfRows=page_size or PAGE_SIZE[source])
-    if source in ("DS-002", "DS-006"):
+    if source == "DS-005":
         params["returnType"] = "json"
     if source == "DS-002":
-        params.update({"cond[trd_clcln_ymd::EQ]": period, "cond[whsl_mrkt_cd::EQ]": entity})
-    elif source == "DS-003":
         first = date.fromisoformat(period + "-01")
         params.update(dataCd="ASOS", dateCd="DAY", dataType="JSON", stnIds=entity,
                       startDt=first.strftime("%Y%m%d"), endDt=min(END, month_end(first)).strftime("%Y%m%d"))
+    elif source == "DS-003":
+        params.update(strtYymm=period.replace("-", ""), endYymm=period.replace("-", ""))
+        if entity != "ALL":
+            params["hsSgn"] = entity
     elif source == "DS-004":
-        params.update(strtYymm=period.replace("-", ""), endYymm=period.replace("-", ""), hsSgn=entity)
-    elif source == "DS-005":
         params.update(out="json", date=period.replace("-", ""))
         if entity != "ALL":
             require(entity in FUEL_CODES, "unknown Opinet product")
             params["prodcd"] = entity
-    credential = ({"code": env["OPINET_API_KEY"]} if source == "DS-005"
+    credential = ({"code": env["OPINET_API_KEY"]} if source == "DS-004"
                   else {"serviceKey": unquote(env["DATA_GO_KR_SERVICE_KEY"])})
     return URLS[source] + op + "?" + urlencode(params | credential), params
 
@@ -98,17 +100,41 @@ def api_error(code):
     raise CollectionError("API " + (str(code) if safe.isalnum() and len(safe) <= 32 else "error"))
 
 
+TRADE_MEASURES = ("impWgt", "expWgt", "impDlr", "expDlr", "balPayments")
+
+
+def trade_rows(raw, period, entity):
+    root = ET.fromstring(raw)
+    code = root.findtext("header/resultCode")
+    if code != "00":
+        api_error(code or root.findtext(".//returnReasonCode") or "missing-header")
+    items = root.find("body/items")
+    require(items is not None, "missing customs items")
+    rows, totals = {}, []
+    for item in items.findall("item"):
+        r = {field.tag: field.text for field in item}
+        if r.get("year") == "총계":
+            totals.append(r)
+            continue
+        hs = r["hsCode"]
+        # The nationwide control for 2022-01 includes a nine-digit source value.
+        # Keep it verbatim for reconciliation. Agricultural detail must be ten digits.
+        pattern = r"[0-9]{9,10}" if entity == "ALL" else r"[0-9]{10}"
+        require(re.fullmatch(pattern, hs) and (entity == "ALL" or hs.startswith(entity))
+                and r["year"] == period.replace("-", ".") and hs not in rows,
+                "unexpected or duplicate customs month/HS code")
+        rows[hs] = r
+    require(len(totals) == 1 if rows else len(totals) <= 1, "missing or duplicate customs total")
+    if totals:
+        for field in TRADE_MEASURES:
+            require(sum(int(r[field]) for r in rows.values()) == int(totals[0][field]),
+                    f"customs total mismatch for {field}")
+    return rows
+
+
 def parse(source, period, entity, page, raw, *, page_size=None):
-    if source == "DS-004":
-        root = ET.fromstring(raw)
-        code = root.findtext("header/resultCode")
-        if code != "00":
-            api_error(code or root.findtext(".//returnReasonCode") or "missing-header")
-        require(root.find("body") is not None, "missing customs body")
-        rows = [item for item in root.findall("body/items/item") if item.findtext("year") != "총계"]
-        require(all(r.findtext("year") == period.replace("-", ".") and r.findtext("hsCode") == entity for r in rows),
-                "unexpected customs month or HS code")
-        require(len(rows) <= 1, "duplicate monthly customs rows")
+    if source == "DS-003":
+        rows = trade_rows(raw, period, entity)
         return len(rows), len(rows)
     if raw.lstrip().startswith(b"<"):
         root = ET.fromstring(raw)
@@ -130,7 +156,7 @@ def parse(source, period, entity, page, raw, *, page_size=None):
                     and str(r["WHSALCD"]) == entity for i, r in enumerate(rows, first)),
                 "unexpected settlement row number, market or day")
         return len(rows), total
-    if source == "DS-005":
+    if source == "DS-004":
         rows = data["RESULT"]["OIL"]
         end = date.fromisoformat(period)
         products = FUEL_CODES if entity == "ALL" else {entity}
@@ -142,7 +168,7 @@ def parse(source, period, entity, page, raw, *, page_size=None):
         return len(rows), len(rows)
     response = data["response"]
     code = str(response["header"]["resultCode"])
-    if source == "DS-003" and code == "03":
+    if source == "DS-002" and code == "03":
         return 0, 0
     if code not in ("0", "00"):
         api_error(code)
@@ -150,14 +176,10 @@ def parse(source, period, entity, page, raw, *, page_size=None):
     total = int(body["totalCount"])
     rows = (body.get("items") or {}).get("item", [])
     response_size = int(body["numOfRows"])
-    # Historical auction pages retain the page size used when they were collected.
-    size = response_size if source == "DS-002" and page_size is None else (page_size or PAGE_SIZE[source])
+    size = page_size or PAGE_SIZE[source]
     require(total >= 0 and size > 0 and response_size == size and int(body["pageNo"]) == page and
             len(rows) == min(size, max(0, total - (page - 1) * size)), "page count mismatch")
     if source == "DS-002":
-        require(all(r["trd_clcln_ymd"] == period and str(r["whsl_mrkt_cd"]) == entity for r in rows),
-                "unexpected auction market or day")
-    elif source == "DS-003":
         dates = {r["tm"] for r in rows}
         require(len(dates) == len(rows) and all(d.startswith(period + "-") and d <= END.isoformat() for d in dates)
                 and all(str(r["stnId"]) == entity for r in rows), "unexpected observation station or date")

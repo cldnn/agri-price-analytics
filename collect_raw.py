@@ -20,13 +20,14 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import build_opener, HTTPRedirectHandler
 
-from ingestion.sources import CollectionError, MARKET_SOURCES, PAGE_SIZE, SETTLEMENT_OP, jobs, parse, request, require
+from ingestion.customs import agriculture_catalog, chapters, export_trade
+from ingestion.sources import CollectionError, PAGE_SIZE, SETTLEMENT_OP, jobs, parse, request, require
 
 ROOT = Path(__file__).resolve().parent
 RAW = ROOT / "data" / "raw"
 META = RAW / "_meta"
 KST = timezone(timedelta(hours=9))
-SOURCES = ("DS-001", "DS-002", "DS-003", "DS-004", "DS-005", "DS-006")
+SOURCES = ("DS-001", "DS-002", "DS-003", "DS-004", "DS-005")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (run TEXT PRIMARY KEY, snapshot TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS units (
@@ -130,23 +131,23 @@ def markets(db, run):
         WHERE u.run=? AND u.op='wholesaleMarkets' AND u.status='complete' ORDER BY p.page""", (run,))
     codes = [r["whsl_mrkt_cd"] for page in rows
              for r in json.loads(read_saved(page))["response"]["body"]["items"]["item"]]
-    require(codes and len(set(codes)) == len(codes), "collect DS-006 market catalog first")
+    require(codes and len(set(codes)) == len(codes), "collect DS-005 market catalog first")
     return codes
 
 
 def save_page(db, unit, revision, page, raw, params, count, total, signature):
     source, op, period, entity = (unit[key] for key in ("source", "op", "period", "entity"))
     target = RAW / f"source={source}" / f"operation={op}"
-    if source == "DS-006":
+    if source == "DS-005":
         target /= f"snapshot_date={period}"
     else:
-        dimension = "market" if source in MARKET_SOURCES else {"DS-003": "station", "DS-004": "hs", "DS-005": "product"}[source]
+        dimension = "market" if source == "DS-001" else {"DS-002": "station", "DS-003": "hs", "DS-004": "product"}[source]
         target = target / f"month={period[:7]}" / f"{dimension}={entity}"
         if len(period) == 10:
             target /= f"date={period}"
     target = target / f"run_id={unit['run']}" / f"rev={revision}"
     target.mkdir(parents=True, exist_ok=True)
-    ext = "xml" if source == "DS-004" else "json"
+    ext = "xml" if source == "DS-003" else "json"
     path = target / f"page-{page:06d}.{ext}.gz"
     tmp = path.with_suffix(".part")
     tmp.write_bytes(gzip.compress(raw, compresslevel=3, mtime=0))
@@ -183,8 +184,6 @@ def collect_unit(db, u, env, stop=None):
                      (u["id"], revision)).fetchall()
     saved = {p["page"]: p for p in old}
     page_size = PAGE_SIZE.get(source)
-    if old and source == "DS-002":
-        page_size = int(json.loads(old[0]["params"])["numOfRows"])
     with db:
         db.execute("UPDATE units SET status='partial', error=NULL WHERE id=?", (u["id"],))
     page, received, expected = 1, 0, None
@@ -203,7 +202,7 @@ def collect_unit(db, u, env, stop=None):
                 pass
         if local is not None and page not in (1, len(saved)):
             raw = local
-        elif source == "DS-005":
+        elif source == "DS-004":
             raw = fetch(url, before_request=lambda: reserve_opinet_call(db))
         else:
             raw = fetch(url)
@@ -224,8 +223,8 @@ def collect_unit(db, u, env, stop=None):
             with db:
                 db.execute("UPDATE units SET status=?,error=NULL WHERE id=?",
                            ("complete" if received else "empty", u["id"]))
-                if source == "DS-005" and entity == "ALL":
-                    db.execute("""UPDATE units SET status='superseded' WHERE run=? AND source='DS-005'
+                if source == "DS-004" and entity == "ALL":
+                    db.execute("""UPDATE units SET status='superseded' WHERE run=? AND source='DS-004'
                         AND period=? AND entity='D047' AND status='complete'""", (u["run"], period))
             return
         require(count > 0 and received < expected, "incomplete page sequence")
@@ -287,7 +286,7 @@ def drain_queue(ids, workers, env, args):
                     failures = failures + 1 if error else 0
                     if error in ("API ERROR-350", "API 22"):
                         raise DailyQuota(error)
-                    if args.source == "DS-005" and failures >= 3 and error == "empty Opinet response":
+                    if args.source == "DS-004" and failures >= 3 and error == "empty Opinet response":
                         raise DailyQuota("repeated empty Opinet responses")
                     if error and (failures >= 3 or error.startswith(("HTTP 401", "HTTP 403", "HTTP 429", "API INFO-100"))):
                         raise CollectionError(f"{args.source} paused: {error}")
@@ -307,31 +306,52 @@ def collect(db, args):
     with db:
         db.execute("INSERT OR IGNORE INTO runs VALUES (?,?)", (run, snapshot))
     snapshot = db.execute("SELECT snapshot FROM runs WHERE run=?", (run,)).fetchone()[0]
-    targets = jobs(source, snapshot, markets(db, run) if source in MARKET_SOURCES else (),
-                   args.station or ["108"], args.hs or ["0703101090"])
+    catalog = (agriculture_catalog(META / "DS-003" / run, fetch)
+               if source == "DS-003" and not args.hs else None)
+    targets = jobs(source, snapshot, markets(db, run) if source == "DS-001" else (),
+                   args.station or ["108"], args.hs or (),
+                   hs_chapters=(lambda month: chapters(catalog, month)) if catalog else None)
     with db:
         db.executemany("INSERT OR IGNORE INTO units(run,source,op,period,entity) VALUES (?,?,?,?,?)",
                        ((run, source, *target) for target in targets))
-        if source == "DS-005":
-            db.execute("""UPDATE units SET status='superseded' WHERE run=? AND source='DS-005'
+        if source == "DS-004":
+            db.execute("""UPDATE units SET status='superseded' WHERE run=? AND source='DS-004'
                 AND entity='D047' AND status IN ('planned','partial','failed')""", (run,))
     if args.start_on:
         start = datetime.combine(args.start_on, clock_time(0, 5), tzinfo=KST)
         print(f"{source} resumes at {start.isoformat()}", flush=True)
         wait_until(start)
     env = credentials()
-    workers = args.workers or {"DS-001": 4, "DS-002": 3}.get(source, 1)
+    workers = args.workers or {"DS-001": 4, "DS-003": 4}.get(source, 1)
     backoff = 60
+    retry_failed_trade = True
+    scope, codes = "", ()
+    if source == "DS-003":
+        if args.hs:
+            codes = tuple(args.hs)
+            scope = " AND entity IN (" + ",".join("?" for _ in codes) + ")"
+        else:
+            scope = " AND (length(entity)=2 OR entity='ALL')"
     while True:
-        ids = db.execute("""SELECT id FROM units WHERE run=? AND source=? AND status IN ('planned','partial','failed')
-            ORDER BY id LIMIT ?""", (run, source, args.limit or -1)).fetchall()
-        if source == "DS-006" and ids:
+        order = "(entity='ALL') DESC, id" if catalog else "id"
+        ids = db.execute("""SELECT id FROM units WHERE run=? AND source=? AND status IN ('planned','partial','failed')"""
+                         + scope + f" ORDER BY {order} LIMIT ?",
+                         (run, source, *codes, args.limit or -1)).fetchall()
+        if source == "DS-005" and ids:
             require(snapshot == datetime.now(KST).date().isoformat(), "new snapshot date requires a new run id")
         try:
             drain_queue(ids, workers, env, args)
+            if catalog and not args.limit:
+                if retry_failed_trade and db.execute(
+                    "SELECT 1 FROM units WHERE run=? AND source=? AND status='failed'" + scope + " LIMIT 1",
+                    (run, source, *codes),
+                ).fetchone():
+                    retry_failed_trade = False
+                    continue
+                export_trade(db, run, catalog, RAW / "source=DS-003" / "_index" / run, read_saved)
             return
         except (DailyQuota, RateLimited) as exc:
-            if (source not in MARKET_SOURCES and source != "DS-005") or args.limit:
+            if source not in ("DS-001", "DS-003", "DS-004") or args.limit:
                 raise
             now = datetime.now(KST)
             if isinstance(exc, DailyQuota):
@@ -369,13 +389,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["collect", "status", "verify", "manifest"])
     parser.add_argument("--run", default="initial-20261124")
-    parser.add_argument("--source", choices=SOURCES)
+    parser.add_argument("--source", choices=SOURCES,
+                        help="DS-001 settlement, DS-002 weather, DS-003 trade, DS-004 fuel, DS-005 reference codes")
     parser.add_argument("--limit", type=int, help="maximum unfinished units to process in this invocation")
-    parser.add_argument("--workers", type=int, help="concurrent market/date units (defaults: settlement 4, auction 3, other 1)")
+    parser.add_argument("--workers", type=int, help="concurrent units (defaults: settlement/customs 4, other 1)")
     parser.add_argument("--start-on", type=date.fromisoformat, help="wait until this date in Korea before collecting")
     parser.add_argument("--reserve-gib", type=int, default=8, help="free disk space to retain (default: 8 GiB)")
     parser.add_argument("--station", action="append", help="ASOS station id (default: Seoul 108)")
-    parser.add_argument("--hs", action="append", help="HS code (default: onion 0703101090)")
+    parser.add_argument("--hs", action="append", help="restrict DS-003 to these HS codes (default: all KATI agriculture chapters)")
     args = parser.parse_args()
     if (not re.fullmatch(r"[a-zA-Z0-9_-]{1,48}", args.run) or args.reserve_gib < 0
         or (args.limit is not None and args.limit < 1) or (args.workers is not None and args.workers < 1)
@@ -389,19 +410,34 @@ def main():
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version == 0:
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            require(not db.execute("SELECT 1 FROM units WHERE source <> 'DS-001' LIMIT 1").fetchone()
+                    or db.execute("PRAGMA user_version").fetchone()[0] == 1,
+                    "legacy source numbers: run python -m ingestion.migrate_source_ids first")
+            db.execute("PRAGMA user_version=1")
+    else:
+        require(version == 1, "unknown collection database version")
     if args.action == "collect":
         with writer_lock(args.run, args.source):
             collect(db, args)
     elif args.action == "verify":
         verify(db, args.run)
     elif args.action == "status":
-        for r in db.execute("""SELECT CASE WHEN source='DS-005' THEN source||' product='||entity ELSE source END scope,
+        trade_scope = """CASE
+            WHEN source='DS-003' AND entity='ALL' THEN 'DS-003 nationwide reconciliation'
+            WHEN source='DS-003' AND length(entity)=2 THEN 'DS-003 HS chapters'
+            WHEN source='DS-003' THEN 'DS-003 individual queries'
+            ELSE source END"""
+        for r in db.execute(f"""SELECT CASE WHEN source='DS-004' THEN source||' product='||entity ELSE {trade_scope} END scope,
             status,count(*) AS units FROM units WHERE run=? GROUP BY scope,status ORDER BY scope,status""", (args.run,)):
             print(*r)
-        for r in db.execute("""SELECT source,count(*) AS files,sum(rows),sum(compressed_bytes)
+        for r in db.execute(f"""SELECT {trade_scope} scope,count(*) AS files,sum(rows),sum(compressed_bytes)
             FROM units u JOIN pages p ON p.unit=u.id AND p.revision=u.revision
-            WHERE run=? GROUP BY source ORDER BY source""", (args.run,)):
-            print(*r, "(files, rows, compressed bytes)")
+            WHERE run=? GROUP BY scope ORDER BY scope""", (args.run,)):
+            print(*r, "(files, response rows, compressed bytes)")
     else:
         # One record per page, or one per outstanding unit without a saved page.
         for row in db.execute("""SELECT u.source,u.op,u.period,u.entity,u.status,u.error,u.revision,p.*
